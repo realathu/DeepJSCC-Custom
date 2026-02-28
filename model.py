@@ -100,18 +100,18 @@ class _Encoder(nn.Module):
             if z_hat.dim() == 4:
                 # size is (B, C, H, W) -> k is C * H * W
                 k = z_hat.size(1) * z_hat.size(2) * z_hat.size(3)
-                # Compute power per sample in the batch
+                # Compute power per sample in the batch, keepdim for broadcast
                 sig_pwr = torch.sum(z_hat.square(), dim=(1, 2, 3), keepdim=True)
             elif z_hat.dim() == 3:
                 k = z_hat.size(0) * z_hat.size(1) * z_hat.size(2)
-                sig_pwr = torch.sum(z_hat.square(), keepdim=True)
+                # dim must be explicit when keepdim=True
+                sig_pwr = torch.sum(z_hat.square(), dim=(0, 1, 2), keepdim=True)
             else:
                 raise ValueError('Unknown size of input')
-            
-            # Normalise to average power P
-            # (sqrt(P * k) / sqrt(sig_pwr)) * z_hat
-            p_k = P * k
-            scale = torch.sqrt(p_k / sig_pwr)
+
+            # Normalise: output has average symbol power == P
+            # scale = sqrt(P * k / sig_pwr)
+            scale = torch.sqrt(P * k / sig_pwr)
             return z_hat * scale
         return _inner
 
