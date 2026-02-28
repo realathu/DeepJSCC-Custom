@@ -93,22 +93,26 @@ class _Encoder(nn.Module):
         self.norm = self._normlizationLayer(P=P)
 
     @staticmethod
-    def _normlizationLayer(P=1):
+    def _normlizationLayer(P=1.0):
         def _inner(z_hat: torch.Tensor):
+            # CUDAGraph / torch.compile friendly implementation
+            # Avoids torch.tensor(sizes), matrix mults, and host-device syncs.
             if z_hat.dim() == 4:
-                batch_size = z_hat.size()[0]
-                k = torch.prod(torch.tensor(z_hat.size()[1:]))
+                # size is (B, C, H, W) -> k is C * H * W
+                k = z_hat.size(1) * z_hat.size(2) * z_hat.size(3)
+                # Compute power per sample in the batch
+                sig_pwr = torch.sum(z_hat.square(), dim=(1, 2, 3), keepdim=True)
             elif z_hat.dim() == 3:
-                batch_size = 1
-                k = torch.prod(torch.tensor(z_hat.size()))
+                k = z_hat.size(0) * z_hat.size(1) * z_hat.size(2)
+                sig_pwr = torch.sum(z_hat.square(), keepdim=True)
             else:
-                raise Exception('Unknown size of input')
-            z_temp = z_hat.reshape(batch_size, 1, 1, -1)
-            z_trans = z_hat.reshape(batch_size, 1, -1, 1)
-            tensor = torch.sqrt(P * k) * z_hat / torch.sqrt((z_temp @ z_trans))
-            if batch_size == 1:
-                return tensor.squeeze(0)
-            return tensor
+                raise ValueError('Unknown size of input')
+            
+            # Normalise to average power P
+            # (sqrt(P * k) / sqrt(sig_pwr)) * z_hat
+            p_k = P * k
+            scale = torch.sqrt(p_k / sig_pwr)
+            return z_hat * scale
         return _inner
 
     def forward(self, x):
