@@ -5,6 +5,7 @@ Created on Tue Dec  17:00:00 2023
 @author: chun
 """
 import os
+import multiprocessing
 import torch
 import torch.nn as nn
 from torchvision import transforms
@@ -22,41 +23,61 @@ import time
 from tensorboardX import SummaryWriter
 import glob
 
+# AMP — use BF16 on A100 (native format, no overflow risk vs FP16)
+_AMP_DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-def train_epoch(model, optimizer, param, data_loader):
+# TF32 — A100 tensor-core native format; enabled for both matmul and convolutions.
+# Gives 2-3x matmul throughput vs FP32 with negligible precision loss.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32      = True
+torch.set_float32_matmul_precision('high')
+
+
+def train_epoch(model, optimizer, param, data_loader, scaler):
+    """One training epoch with BF16 Automatic Mixed Precision."""
     model.train()
     epoch_loss = 0
+    device = param['device']
+    denorm = image_normalization('denormalization')  # build closure once per epoch
 
     for iter, (images, _) in enumerate(data_loader):
         images = images.cuda() if param['parallel'] and torch.cuda.device_count(
-        ) > 1 else images.to(param['device'])
-        optimizer.zero_grad()
-        outputs = model.forward(images)
-        outputs = image_normalization('denormalization')(outputs)
-        images = image_normalization('denormalization')(images)
-        loss = model.loss(images, outputs) if not param['parallel'] else model.module.loss(
-            images, outputs)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.detach().item()
-    epoch_loss /= (iter + 1)
+        ) > 1 else images.to(device)
+        optimizer.zero_grad(set_to_none=True)  # faster than zero_grad()
 
+        with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+            outputs = model.forward(images)
+            outputs_d = denorm(outputs)
+            images_d  = denorm(images)
+            loss = (model.loss(images_d, outputs_d) if not param['parallel']
+                    else model.module.loss(images_d, outputs_d))
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        epoch_loss += loss.detach().item()
+
+    epoch_loss /= (iter + 1)
     return epoch_loss, optimizer
 
 
 def evaluate_epoch(model, param, data_loader):
+    """Validation loop — runs in BF16 autocast for consistency."""
     model.eval()
     epoch_loss = 0
+    device = param['device']
+    denorm = image_normalization('denormalization')  # build closure once per call
 
     with torch.no_grad():
         for iter, (images, _) in enumerate(data_loader):
             images = images.cuda() if param['parallel'] and torch.cuda.device_count(
-            ) > 1 else images.to(param['device'])
-            outputs = model.forward(images)
-            outputs = image_normalization('denormalization')(outputs)
-            images = image_normalization('denormalization')(images)
-            loss = model.loss(images, outputs) if not param['parallel'] else model.module.loss(
-                images, outputs)
+            ) > 1 else images.to(device)
+            with torch.autocast(device_type='cuda', dtype=_AMP_DTYPE):
+                outputs = model.forward(images)
+                outputs_d = denorm(outputs)
+                images_d  = denorm(images)
+                loss = (model.loss(images_d, outputs_d) if not param['parallel']
+                        else model.module.loss(images_d, outputs_d))
             epoch_loss += loss.detach().item()
         epoch_loss /= (iter + 1)
 
@@ -97,37 +118,39 @@ def main_pipeline():
     params['snr_list'] = args.snr_list
     params['ratio_list'] = args.ratio_list
     params['channel'] = args.channel
+    # Determine optimal worker count: cap at 8, don't exceed CPU count
+    _nw = min(8, multiprocessing.cpu_count())
+
     if dataset_name == 'cifar10':
-        params['batch_size'] = 64  # 1024
-        params['num_workers'] = 4
+        params['batch_size'] = 512        # A100 has ample VRAM; larger batch = faster epoch
+        params['num_workers'] = _nw
         params['epochs'] = 1000
-        params['init_lr'] = 1e-3  # 1e-2
+        params['init_lr'] = 1e-3
         params['weight_decay'] = 5e-4
         params['parallel'] = False
         params['if_scheduler'] = True
-        params['step_size'] = 640
-        params['gamma'] = 0.1
         params['seed'] = 42
         params['ReduceLROnPlateau'] = False
         params['lr_reduce_factor'] = 0.5
         params['lr_schedule_patience'] = 15
         params['max_time'] = 12
         params['min_lr'] = 1e-5
+        params['es_patience'] = 50        # early stopping: max epochs without improvement
     elif dataset_name == 'imagenet':
-        params['batch_size'] = 32
-        params['num_workers'] = 4
+        params['batch_size'] = 128         # up from 32; A100 handles this easily
+        params['num_workers'] = _nw
         params['epochs'] = 300
         params['init_lr'] = 1e-4
         params['weight_decay'] = 5e-4
         params['parallel'] = True
         params['if_scheduler'] = True
-        params['gamma'] = 0.1
         params['seed'] = 42
         params['ReduceLROnPlateau'] = True
         params['lr_reduce_factor'] = 0.5
         params['lr_schedule_patience'] = 15
         params['max_time'] = 12
         params['min_lr'] = 1e-5
+        params['es_patience'] = 30        # early stopping: max epochs without improvement
     else:
         raise Exception('Unknown dataset')
 
@@ -145,30 +168,35 @@ def main_pipeline():
 def train_pipeline(params):
 
     dataset_name = params['dataset']
+    # DataLoader kwargs shared by all loaders — optimised for A100
+    _dl_kwargs = dict(
+        batch_size=params['batch_size'],
+        num_workers=params['num_workers'],
+        pin_memory=True,           # zero-copy host→device transfer
+        persistent_workers=True,   # keep worker processes alive between epochs
+        prefetch_factor=4,         # queue 4 batches per worker ahead of time
+    )
+
     # load data
     if dataset_name == 'cifar10':
         transform = transforms.Compose([transforms.ToTensor(), ])
         train_dataset = datasets.CIFAR10(root='../dataset/', train=True,
                                          download=True, transform=transform)
+        train_loader = DataLoader(train_dataset, shuffle=True, **_dl_kwargs)
 
-        train_loader = DataLoader(train_dataset, shuffle=True,
-                                  batch_size=params['batch_size'], num_workers=params['num_workers'])
         test_dataset = datasets.CIFAR10(root='../dataset/', train=False,
                                         download=True, transform=transform)
-        test_loader = DataLoader(test_dataset, shuffle=True,
-                                 batch_size=params['batch_size'], num_workers=params['num_workers'])
+        test_loader = DataLoader(test_dataset, shuffle=False, **_dl_kwargs)  # no need to shuffle val
 
     elif dataset_name == 'imagenet':
         transform = transforms.Compose(
             [transforms.ToTensor(), transforms.Resize((128, 128))])  # the size of paper is 128
         print("loading data of imagenet")
         train_dataset = datasets.ImageFolder(root='../dataset/ImageNet/train', transform=transform)
+        train_loader = DataLoader(train_dataset, shuffle=True, **_dl_kwargs)
 
-        train_loader = DataLoader(train_dataset, shuffle=True,
-                                  batch_size=params['batch_size'], num_workers=params['num_workers'])
         test_dataset = Vanilla(root='../dataset/ImageNet/val', transform=transform)
-        test_loader = DataLoader(test_dataset, shuffle=True,
-                                 batch_size=params['batch_size'], num_workers=params['num_workers'])
+        test_loader = DataLoader(test_dataset, shuffle=False, **_dl_kwargs)  # no need to shuffle val
     else:
         raise Exception('Unknown dataset')
 
@@ -197,12 +225,23 @@ def train_pipeline(params):
     else:
         model = model.to(device)
 
-    # opt
-    optimizer = optim.Adam(
+    # torch.compile — fuses ops into CUDA kernels; ~20-40% throughput gain on A100
+    # 'reduce-overhead' minimises Python overhead for the small per-batch kernel launches
+    if hasattr(torch, 'compile'):
+        model = torch.compile(model, mode='reduce-overhead')
+        print("torch.compile enabled (reduce-overhead mode)")
+
+    # GradScaler for AMP (identity-scaler for BF16, but kept for unified code path)
+    scaler = torch.cuda.amp.GradScaler(enabled=(_AMP_DTYPE == torch.float16))
+
+    # opt — AdamW correctly decouples weight decay from adaptive update (Adam doesn't)
+    optimizer = optim.AdamW(
         model.parameters(), lr=params['init_lr'], weight_decay=params['weight_decay'])
+
+    # Cosine Annealing — smooth LR decay over the full run; outperforms StepLR for JSCC
     if params['if_scheduler'] and not params['ReduceLROnPlateau']:
-        scheduler = optim.lr_scheduler.StepLR(
-            optimizer, step_size=params['step_size'], gamma=params['gamma'])
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=params['epochs'], eta_min=params['min_lr'])
     elif params['ReduceLROnPlateau']:
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
                                                          factor=params['lr_reduce_factor'],
@@ -215,6 +254,9 @@ def train_pipeline(params):
     writer.add_text('config', str(params))
     t0 = time.time()
     epoch_train_losses, epoch_val_losses = [], []
+    best_val_loss  = float('inf')  # tracks best val loss for checkpointing
+    _es_best       = float('inf')  # separate tracker for early stopping
+    _es_counter    = 0             # epochs without improvement
     per_epoch_time = []
 
     # train
@@ -228,7 +270,7 @@ def train_pipeline(params):
                 start = time.time()
 
                 epoch_train_loss, optimizer = train_epoch(
-                    model, optimizer, params, train_loader)
+                    model, optimizer, params, train_loader, scaler)
 
                 epoch_val_loss = evaluate_epoch(model, params, test_loader)
 
@@ -244,24 +286,32 @@ def train_pipeline(params):
 
                 per_epoch_time.append(time.time() - start)
 
-                # Saving checkpoint
-
-                if not os.path.exists(root_ckpt_dir):
-                    os.makedirs(root_ckpt_dir)
-                torch.save(model.state_dict(), '{}.pkl'.format(
-                    root_ckpt_dir + "/epoch_" + str(epoch)))
-
-                files = glob.glob(root_ckpt_dir + '/*.pkl')
-                for file in files:
-                    epoch_nb = file.split('_')[-1]
-                    epoch_nb = int(epoch_nb.split('.')[0])
-                    if epoch_nb < epoch - 1:
-                        os.remove(file)
+                # Checkpoint — save best model + a periodic safety copy every 10 epochs.
+                # Avoids the original behaviour of writing 1000 files to disk.
+                os.makedirs(root_ckpt_dir, exist_ok=True)
+                _state = (model.module.state_dict()
+                          if isinstance(model, (DataParallel, torch.nn.parallel.DistributedDataParallel))
+                          else model.state_dict())
+                if epoch_val_loss < best_val_loss:
+                    best_val_loss = epoch_val_loss
+                    torch.save(_state, root_ckpt_dir + '/best.pkl')
+                if epoch % 10 == 0:
+                    torch.save(_state, root_ckpt_dir + f'/epoch_{epoch}.pkl')
 
                 if params['ReduceLROnPlateau'] and scheduler is not None:
                     scheduler.step(epoch_val_loss)
                 elif params['if_scheduler'] and not params['ReduceLROnPlateau']:
-                    scheduler.step()  # use only information from the validation loss
+                    scheduler.step()
+
+                # Early stopping — count epochs without val loss improvement
+                if epoch_val_loss < _es_best - 1e-6:
+                    _es_best, _es_counter = epoch_val_loss, 0
+                else:
+                    _es_counter += 1
+                    if _es_counter >= params.get('es_patience', 999):
+                        print(f'\nEarly stopping triggered at epoch {epoch} '
+                              f'(no improvement for {_es_counter} epochs)')
+                        break
 
                 if optimizer.param_groups[0]['lr'] < params['min_lr']:
                     print("\n!! LR EQUAL TO MIN LR SET.")

@@ -37,13 +37,21 @@ def save_model(model, dir, path):
     print("Model saved in {}".format(path))
 
 
-def set_seed(seed):
+def set_seed(seed, deterministic=False):
+    """Set random seeds for reproducibility.
+
+    Args:
+        seed: integer seed value.
+        deterministic: if True, forces cuDNN into deterministic mode (slower but
+            reproducible across runs). Default is False so cuDNN's auto-tuner can
+            select the fastest convolution kernels for the current hardware (A100).
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic  # auto-tune kernels
 
 
 def view_model_param(model):

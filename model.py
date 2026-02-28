@@ -21,65 +21,75 @@ from channel import Channel
     return _inner """
 
 
-def ratio2filtersize(x: torch.Tensor, ratio):
+def ratio2filtersize(x: torch.Tensor, ratio: float) -> int:
+    """Convert compression ratio to inner channel count.
+
+    The encoder applies two stride-2 convolutions, so spatial dims are
+    divided by 4 in each axis (factor 16 total area reduction).
+    Computed analytically to avoid instantiating a dummy encoder model.
+    """
     if x.dim() == 4:
-        # before_size = np.prod(x.size()[1:])
-        before_size = torch.prod(torch.tensor(x.size()[1:]))
+        before_size = x[0].numel()
+        h, w = x.shape[-2] // 4, x.shape[-1] // 4
     elif x.dim() == 3:
-        # before_size = np.prod(x.size())
-        before_size = torch.prod(torch.tensor(x.size()))
+        before_size = x.numel()
+        h, w = x.shape[-2] // 4, x.shape[-1] // 4
     else:
         raise Exception('Unknown size of input')
-    encoder_temp = _Encoder(is_temp=True)
-    z_temp = encoder_temp(x)
-    # c = before_size * ratio / np.prod(z_temp.size()[-2:])
-    c = before_size * ratio / torch.prod(torch.tensor(z_temp.size()[-2:]))
-    return int(c)
+    c = before_size * ratio / (h * w)
+    return max(1, int(c))
 
 
 class _ConvWithPReLU(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+    """Conv2d + optional BatchNorm + PReLU."""
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, use_bn=True):
         super(_ConvWithPReLU, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        # bias is redundant when BN is present (BN re-centres activations)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding,
+                              bias=not use_bn)
+        self.bn   = nn.BatchNorm2d(out_channels) if use_bn else nn.Identity()
         self.prelu = nn.PReLU()
-
         nn.init.kaiming_normal_(self.conv.weight, mode='fan_out', nonlinearity='leaky_relu')
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.prelu(x)
-        return x
+        return self.prelu(self.bn(self.conv(x)))
 
 
 class _TransConvWithPReLU(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, activate=nn.PReLU(), padding=0, output_padding=0):
+    """ConvTranspose2d + optional BatchNorm + configurable activation."""
+    def __init__(self, in_channels, out_channels, kernel_size, stride,
+                 activate=None, padding=0, output_padding=0, use_bn=True):
         super(_TransConvWithPReLU, self).__init__()
+        if activate is None:
+            activate = nn.PReLU()
         self.transconv = nn.ConvTranspose2d(
-            in_channels, out_channels, kernel_size, stride, padding, output_padding)
+            in_channels, out_channels, kernel_size, stride, padding, output_padding,
+            bias=not use_bn)
+        self.bn       = nn.BatchNorm2d(out_channels) if use_bn else nn.Identity()
         self.activate = activate
-        if activate == nn.PReLU():
+        # use isinstance so the check works correctly (== compares identity, not type)
+        if isinstance(activate, nn.PReLU):
             nn.init.kaiming_normal_(self.transconv.weight, mode='fan_out',
                                     nonlinearity='leaky_relu')
         else:
             nn.init.xavier_normal_(self.transconv.weight)
 
     def forward(self, x):
-        x = self.transconv(x)
-        x = self.activate(x)
-        return x
+        return self.activate(self.bn(self.transconv(x)))
 
 
 class _Encoder(nn.Module):
     def __init__(self, c=1, is_temp=False, P=1):
         super(_Encoder, self).__init__()
         self.is_temp = is_temp
-        # self.imgae_normalization = _image_normalization(norm_type='nomalization')
-        self.conv1 = _ConvWithPReLU(in_channels=3, out_channels=16, kernel_size=5, stride=2, padding=2)
+        self.conv1 = _ConvWithPReLU(in_channels=3,  out_channels=16, kernel_size=5, stride=2, padding=2)
         self.conv2 = _ConvWithPReLU(in_channels=16, out_channels=32, kernel_size=5, stride=2, padding=2)
-        self.conv3 = _ConvWithPReLU(in_channels=32, out_channels=32,
-                                    kernel_size=5, padding=2)  # padding size could be changed here
+        # conv3 + conv4 form a residual block (both 32→32, same spatial size)
+        self.conv3 = _ConvWithPReLU(in_channels=32, out_channels=32, kernel_size=5, padding=2)
         self.conv4 = _ConvWithPReLU(in_channels=32, out_channels=32, kernel_size=5, padding=2)
-        self.conv5 = _ConvWithPReLU(in_channels=32, out_channels=2*c, kernel_size=5, padding=2)
+        # conv5: no BN — output feeds directly into power normalisation
+        self.conv5 = _ConvWithPReLU(in_channels=32, out_channels=2*c, kernel_size=5, padding=2,
+                                    use_bn=False)
         self.norm = self._normlizationLayer(P=P)
 
     @staticmethod
@@ -87,15 +97,12 @@ class _Encoder(nn.Module):
         def _inner(z_hat: torch.Tensor):
             if z_hat.dim() == 4:
                 batch_size = z_hat.size()[0]
-                # k = np.prod(z_hat.size()[1:])
                 k = torch.prod(torch.tensor(z_hat.size()[1:]))
             elif z_hat.dim() == 3:
                 batch_size = 1
-                # k = np.prod(z_hat.size())
                 k = torch.prod(torch.tensor(z_hat.size()))
             else:
                 raise Exception('Unknown size of input')
-            # k = torch.tensor(k)
             z_temp = z_hat.reshape(batch_size, 1, 1, -1)
             z_trans = z_hat.reshape(batch_size, 1, -1, 1)
             tensor = torch.sqrt(P * k) * z_hat / torch.sqrt((z_temp @ z_trans))
@@ -105,11 +112,11 @@ class _Encoder(nn.Module):
         return _inner
 
     def forward(self, x):
-        # x = self.imgae_normalization(x)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
+        x   = self.conv1(x)
+        x   = self.conv2(x)
+        res = x                        # residual shortcut: skip conv3 + conv4
+        x   = self.conv3(x)
+        x   = self.conv4(x) + res      # add shortcut — same shape (32 ch, same HW)
         if not self.is_temp:
             x = self.conv5(x)
             x = self.norm(x)
@@ -119,25 +126,27 @@ class _Encoder(nn.Module):
 class _Decoder(nn.Module):
     def __init__(self, c=1):
         super(_Decoder, self).__init__()
-        # self.imgae_normalization = _image_normalization(norm_type='denormalization')
         self.tconv1 = _TransConvWithPReLU(
             in_channels=2*c, out_channels=32, kernel_size=5, stride=1, padding=2)
+        # tconv2 + tconv3 form a residual block (both 32→32, same spatial size)
         self.tconv2 = _TransConvWithPReLU(
             in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=2)
         self.tconv3 = _TransConvWithPReLU(
             in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=2)
-        self.tconv4 = _TransConvWithPReLU(in_channels=32, out_channels=16, kernel_size=5, stride=2, padding=2, output_padding=1)
+        self.tconv4 = _TransConvWithPReLU(
+            in_channels=32, out_channels=16, kernel_size=5, stride=2, padding=2, output_padding=1)
+        # tconv5: no BN — Sigmoid output layer, want clean [0,1] range
         self.tconv5 = _TransConvWithPReLU(
-            in_channels=16, out_channels=3, kernel_size=5, stride=2, padding=2, output_padding=1,activate=nn.Sigmoid())
-        # may be some problems in tconv4 and tconv5, the kernal_size is not the same as the paper which is 5
+            in_channels=16, out_channels=3, kernel_size=5, stride=2, padding=2,
+            output_padding=1, activate=nn.Sigmoid(), use_bn=False)
 
     def forward(self, x):
-        x = self.tconv1(x)
-        x = self.tconv2(x)
-        x = self.tconv3(x)
-        x = self.tconv4(x)
-        x = self.tconv5(x)
-        # x = self.imgae_normalization(x)
+        x   = self.tconv1(x)
+        res = x                        # residual shortcut: skip tconv2 + tconv3
+        x   = self.tconv2(x)
+        x   = self.tconv3(x) + res     # add shortcut — same shape (32 ch, same HW)
+        x   = self.tconv4(x)
+        x   = self.tconv5(x)
         return x
 
 
@@ -148,6 +157,14 @@ class DeepJSCC(nn.Module):
         if snr is not None:
             self.channel = Channel(channel_type, snr)
         self.decoder = _Decoder(c=c)
+        self.criterion = nn.MSELoss(reduction='mean')
+        # Try to import SSIM at construction time; fall back to pure MSE gracefully
+        try:
+            from pytorch_msssim import ssim as _ssim_fn
+            self._ssim_fn   = _ssim_fn
+            self._use_ssim  = True
+        except ImportError:
+            self._use_ssim  = False
 
     def forward(self, x):
         z = self.encoder(x)
@@ -167,10 +184,19 @@ class DeepJSCC(nn.Module):
             return self.channel.get_channel()
         return None
 
-    def loss(self, prd, gt):
-        criterion = nn.MSELoss(reduction='mean')
-        loss = criterion(prd, gt)
-        return loss
+    def loss(self, prd, gt, alpha: float = 0.85):
+        """Combined SSIM + MSE loss (α·SSIM_loss + (1-α)·MSE).
+
+        Falls back to pure MSE if pytorch-msssim is not installed.
+        prd / gt are expected in the [0, 255] range (after denorm).
+        """
+        mse = self.criterion(prd, gt)
+        if self._use_ssim:
+            # SSIM loss: 1 - SSIM so lower = better, matches MSE direction
+            ssim_loss = 1.0 - self._ssim_fn(
+                prd, gt, data_range=255.0, size_average=True)
+            return alpha * ssim_loss + (1.0 - alpha) * mse
+        return mse
 
 
 if __name__ == '__main__':

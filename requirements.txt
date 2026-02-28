@@ -1,6 +1,9 @@
 torch
-torchvison
+torchvision
 matplotlib
 tqdm
 numpy
 pillow
+pytorch-msssim
+pyyaml
+tensorboardX

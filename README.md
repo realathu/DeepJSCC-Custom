@@ -146,3 +146,6 @@ If you find (part of) this code useful for your research, please consider citing
   year = {2023}
 }
 
+# DeepJSCC-Custom
+
+Optimized PyTorch implementation of Deep JSCC for A100.
