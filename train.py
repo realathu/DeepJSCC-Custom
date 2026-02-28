@@ -226,13 +226,13 @@ def train_pipeline(params):
         model = model.to(device)
 
     # torch.compile — fuses ops into CUDA kernels; ~20-40% throughput gain on A100
-    # 'reduce-overhead' minimises Python overhead for the small per-batch kernel launches
+    # dynamic=True prevents recompilation warnings when grad_mode switches train<->eval
     if hasattr(torch, 'compile'):
-        model = torch.compile(model, mode='reduce-overhead')
-        print("torch.compile enabled (reduce-overhead mode)")
+        model = torch.compile(model, mode='reduce-overhead', dynamic=True)
+        print("torch.compile enabled (reduce-overhead mode, dynamic=True)")
 
     # GradScaler for AMP (identity-scaler for BF16, but kept for unified code path)
-    scaler = torch.cuda.amp.GradScaler(enabled=(_AMP_DTYPE == torch.float16))
+    scaler = torch.amp.GradScaler('cuda', enabled=(_AMP_DTYPE == torch.float16))
 
     # opt — AdamW correctly decouples weight decay from adaptive update (Adam doesn't)
     optimizer = optim.AdamW(
